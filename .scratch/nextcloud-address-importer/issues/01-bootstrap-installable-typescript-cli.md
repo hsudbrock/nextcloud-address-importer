@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] The CLI can be run from the repository during development and exposes `import` and `address-books` commands.
-- [ ] The package is wired so an npm-compatible install exposes the `nextcloud-address-importer` executable.
-- [ ] Fast project scripts exist for linting, typechecking, and running tests.
-- [ ] Repo-local config files `.nextcloud-address-importer.toml` and `config.toml` remain ignored.
+- [x] The CLI can be run from the repository during development and exposes `import` and `address-books` commands.
+- [x] The package is wired so an npm-compatible install exposes the `nextcloud-address-importer` executable.
+- [x] Fast project scripts exist for linting, typechecking, and running tests.
+- [x] Repo-local config files `.nextcloud-address-importer.toml` and `config.toml` remain ignored.

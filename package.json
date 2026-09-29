@@ -1,0 +1,31 @@
+{
+  "name": "nextcloud-address-importer",
+  "version": "0.1.0",
+  "description": "Local CLI importer for CSV contacts into Nextcloud Contacts via CardDAV.",
+  "type": "module",
+  "bin": {
+    "nextcloud-address-importer": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "lint": "eslint .",
+    "start": "node dist/cli.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "eslint": "^9.36.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1",
+    "vitest": "^5.0.2"
+  }
+}

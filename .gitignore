@@ -1,2 +1,5 @@
 .nextcloud-address-importer.toml
 config.toml
+node_modules/
+dist/
+coverage/
