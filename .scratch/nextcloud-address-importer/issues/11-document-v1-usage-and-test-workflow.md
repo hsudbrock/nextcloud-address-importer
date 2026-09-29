@@ -4,9 +4,9 @@
 
 **Blocked by:** 09: Handle write failures and privacy-safe partial imports; 10: Verify real Nextcloud import behavior.
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Documentation explains how to configure Nextcloud server URL, username, address book, and app password.
-- [ ] Documentation includes CSV examples, dry-run examples, address-book listing examples, and import examples.
-- [ ] Documentation explains exit codes, report behavior, skipped duplicates, and privacy-safe logging.
-- [ ] Documentation explains local development usage, npm-installable usage, and the Dockerized Nextcloud integration test command.
+- [x] Documentation explains how to configure Nextcloud server URL, username, address book, and app password.
+- [x] Documentation includes CSV examples, dry-run examples, address-book listing examples, and import examples.
+- [x] Documentation explains exit codes, report behavior, skipped duplicates, and privacy-safe logging.
+- [x] Documentation explains local development usage, npm-installable usage, and the Dockerized Nextcloud integration test command.
