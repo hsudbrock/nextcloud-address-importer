@@ -8,7 +8,7 @@ export default tseslint.config(
     ignores: ["dist/**", "coverage/**"],
   },
   {
-    files: ["src/**/*.ts"],
+    files: ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts", "vitest.integration.config.ts"],
     languageOptions: {
       parserOptions: {
         project: "./tsconfig.json",

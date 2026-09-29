@@ -15,6 +15,7 @@
     "lint": "eslint .",
     "start": "node dist/cli.js",
     "test": "vitest run",
+    "test:integration:nextcloud": "bash test/integration/nextcloud/run.sh",
     "typecheck": "tsc --noEmit"
   },
   "engines": {

@@ -1,0 +1,28 @@
+# Dockerized Nextcloud fixture for integration tests (issues 06 + 10).
+#
+# LOCAL-ONLY, NON-SECRET test credentials. This instance binds to loopback,
+# starts from a clean isolated volume on every run (`down -v` before and
+# after in run.sh), and is never exposed beyond the local machine.
+# Do not reuse these credentials anywhere real.
+name: nextcloud-address-importer-test
+
+services:
+  nextcloud:
+    # Pinned major version for reproducible local + CI runs.
+    image: nextcloud:32-apache
+    ports:
+      - "127.0.0.1:8087:80"
+    environment:
+      # Fixed non-secret local test credentials, committed with the setup.
+      NEXTCLOUD_ADMIN_USER: nc-test-admin
+      NEXTCLOUD_ADMIN_PASSWORD: nc-test-local-password
+      # Required for fully automated first-time install (SQLite, no web wizard).
+      SQLITE_DATABASE: nextcloud
+      NEXTCLOUD_TRUSTED_DOMAINS: "localhost 127.0.0.1"
+    volumes:
+      # Named volume: created on `up`, destroyed on `down -v` per run.
+      - nextcloud-address-importer-test-html:/var/www/html
+    restart: "no"
+
+volumes:
+  nextcloud-address-importer-test-html:
