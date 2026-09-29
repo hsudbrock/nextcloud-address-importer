@@ -24,6 +24,7 @@ export type ConnectionConfig = {
 
 export type ContactPlan = {
   operation: "create";
+  rowNumber: number;
   uid: string;
   name: {
     givenName: string;
@@ -38,6 +39,7 @@ export type ContactPlan = {
 export type CliRuntime = {
   env?: Record<string, string | undefined>;
   readFile?: (path: string) => Promise<string | Buffer>;
+  writeFile?: (path: string, contents: string) => Promise<void>;
   fetch?: typeof fetch;
   homeDir?: string;
   isInteractive?: boolean;
@@ -62,7 +64,12 @@ type CliConnectionOptions = {
   username?: string;
   appPassword?: string;
   addressBook?: string;
+  dryRun?: boolean;
+  yes?: boolean;
+  jsonReport?: string;
 };
+
+type CliStringOptionName = "config" | "serverUrl" | "username" | "appPassword" | "addressBook";
 
 type ParsedArgs = {
   positionals: string[];
@@ -81,7 +88,16 @@ type CsvRecord = {
   lineNumber: number;
 };
 
-type CsvRowValues = Record<(typeof requiredCsvHeaders)[number], string>;
+type CsvRowValues = Record<(typeof requiredCsvHeaders)[number], string> & { rowNumber?: number };
+
+type ImportRunReport = {
+  status: "success" | "partial_failure";
+  dryRun: boolean;
+  created: Array<{ rowNumber: number }>;
+  skippedDuplicates: Array<{ rowNumber: number }>;
+  warnings: string[];
+  failedWrites: Array<{ rowNumber: number; message: string }>;
+};
 
 const defaultConfigRelativePath = ".config/nextcloud-address-importer/config.toml";
 const requiredCsvHeaders = ["first_name", "last_name", "telephone", "group"] as const;
@@ -163,17 +179,372 @@ Options:
     return fail(csvValidationResult);
   }
 
-  const rowLabel = csvValidationResult.rowCount === 1 ? "contact row" : "contact rows";
+  const connection = connectionResult.connection;
+
+  if (connection === undefined) {
+    return fail("Connection configuration could not be resolved.");
+  }
+
+  const discoveryResult = await discoverAddressBooks(connection, runtime);
+
+  if (typeof discoveryResult === "string") {
+    return fail(discoveryResult);
+  }
+
+  const selectedAddressBookResult = selectImportAddressBook(discoveryResult, connection, runtime);
+
+  if (typeof selectedAddressBookResult === "string") {
+    return fail(selectedAddressBookResult);
+  }
+
+  const existingIdentitiesResult = await fetchExistingIdentities(selectedAddressBookResult, connection, runtime);
+
+  if (typeof existingIdentitiesResult === "string") {
+    return fail(existingIdentitiesResult);
+  }
+
+  const report = parsedArgs.options.dryRun === true
+    ? planDryRun(csvValidationResult.contactPlans, existingIdentitiesResult, csvValidationResult.warnings)
+    : await createContacts(
+        selectedAddressBookResult,
+        connection,
+        csvValidationResult.contactPlans,
+        existingIdentitiesResult,
+        csvValidationResult.warnings,
+        runtime,
+      );
+
+  if (parsedArgs.options.jsonReport !== undefined) {
+    const jsonReportResult = await writeJsonReport(parsedArgs.options.jsonReport, report, runtime);
+
+    if (jsonReportResult !== undefined) {
+      return {
+        exitCode: report.dryRun ? 1 : 2,
+        stdout: [
+          `CSV validation passed: ${csvValidationResult.rowCount} ${csvValidationResult.rowCount === 1 ? "contact row" : "contact rows"} ready from ${csvPath}`,
+          ...renderRunSummary(report),
+        ],
+        stderr: [jsonReportResult],
+        connection,
+      };
+    }
+  }
 
   return {
-    exitCode: 0,
-    stdout: [
-      `CSV validation passed: ${csvValidationResult.rowCount} ${rowLabel} ready from ${csvPath}`,
-      ...csvValidationResult.warnings,
-    ],
+    exitCode: report.status === "partial_failure" ? 2 : 0,
+    stdout: [`CSV validation passed: ${csvValidationResult.rowCount} ${csvValidationResult.rowCount === 1 ? "contact row" : "contact rows"} ready from ${csvPath}`, ...renderRunSummary(report)],
     stderr: [],
-    connection: connectionResult.connection,
+    connection,
   };
+}
+
+function selectImportAddressBook(addressBooks: AddressBook[], connection: ConnectionConfig, runtime: CliRuntime): AddressBook | string {
+  if (connection.addressBook !== undefined) {
+    return selectAddressBook(addressBooks, connection.addressBook);
+  }
+
+  if (addressBooks.length === 1) {
+    return addressBooks[0] ?? "CardDAV discovery failed: no address books were returned.";
+  }
+
+  if (runtime.isInteractive ?? (process.stdin.isTTY === true && process.stdout.isTTY === true)) {
+    return "Interactive address-book selection is not implemented yet. Set --address-book to choose a discovered address book.";
+  }
+
+  return "Multiple address books were discovered. Set --address-book because non-interactive import cannot prompt for a selection.";
+}
+
+type PutResult =
+  | { status: "created" }
+  | { status: "duplicate" }
+  | { status: "failed"; message: string };
+
+function planDryRun(contactPlans: ContactPlan[], existingIdentities: Set<string>, warnings: string[]): ImportRunReport {
+  const report: ImportRunReport = {
+    status: "success",
+    dryRun: true,
+    created: [],
+    skippedDuplicates: [],
+    warnings,
+    failedWrites: [],
+  };
+
+  for (const contactPlan of contactPlans) {
+    if (existingIdentities.has(importIdentityKey(contactPlan.name.givenName, contactPlan.name.familyName, contactPlan.telephone))) {
+      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
+    } else {
+      report.created.push({ rowNumber: contactPlan.rowNumber });
+    }
+  }
+
+  return report;
+}
+
+async function createContacts(
+  addressBook: AddressBook,
+  connection: ConnectionConfig,
+  contactPlans: ContactPlan[],
+  existingIdentities: Set<string>,
+  warnings: string[],
+  runtime: CliRuntime,
+): Promise<ImportRunReport> {
+  const report: ImportRunReport = {
+    status: "success",
+    dryRun: false,
+    created: [],
+    skippedDuplicates: [],
+    warnings,
+    failedWrites: [],
+  };
+
+  for (const contactPlan of contactPlans) {
+    if (existingIdentities.has(importIdentityKey(contactPlan.name.givenName, contactPlan.name.familyName, contactPlan.telephone))) {
+      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
+      continue;
+    }
+
+    const writeResult = await putContactWithRetry(addressBook, connection, contactPlan, runtime);
+
+    if (writeResult.status === "created") {
+      report.created.push({ rowNumber: contactPlan.rowNumber });
+    } else if (writeResult.status === "duplicate") {
+      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
+    } else {
+      report.failedWrites.push({ rowNumber: contactPlan.rowNumber, message: writeResult.message });
+    }
+  }
+
+  if (report.failedWrites.length > 0) {
+    report.status = "partial_failure";
+  }
+
+  return report;
+}
+
+async function putContactWithRetry(
+  addressBook: AddressBook,
+  connection: ConnectionConfig,
+  contactPlan: ContactPlan,
+  runtime: CliRuntime,
+): Promise<PutResult> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await putContact(addressBook, connection, contactPlan, runtime);
+
+    if (result.status !== "failed" || !isRetryablePutFailure(result.message)) {
+      return result;
+    }
+
+    if (attempt === 1) {
+      return result;
+    }
+  }
+
+  return { status: "failed", message: "CardDAV create failed after retry." };
+}
+
+function isRetryablePutFailure(message: string): boolean {
+  return (
+    message.startsWith("Network error") ||
+    message.startsWith("CardDAV create failed with HTTP 5") ||
+    message.startsWith("CardDAV create failed with HTTP 429")
+  );
+}
+
+async function putContact(
+  addressBook: AddressBook,
+  connection: ConnectionConfig,
+  contactPlan: ContactPlan,
+  runtime: CliRuntime,
+): Promise<PutResult> {
+  const fetchImplementation = runtime.fetch ?? fetch;
+  const url = new URL(`${encodeURIComponent(contactPlan.uid)}.vcf`, addressBook.url.endsWith("/") ? addressBook.url : `${addressBook.url}/`);
+  let response: Response;
+
+  try {
+    response = await fetchImplementation(url, {
+      method: "PUT",
+      headers: {
+        Authorization: authorizationHeader(connection),
+        "Content-Type": "text/vcard; charset=utf-8",
+        "If-None-Match": "*",
+      },
+      body: contactPlan.vcard,
+    });
+  } catch {
+    return { status: "failed", message: "Network error while creating contact." };
+  }
+
+  if (response.status === 201 || response.status === 204) {
+    return { status: "created" };
+  }
+
+  if (response.status === 412) {
+    return { status: "duplicate" };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return { status: "failed", message: "CardDAV authentication or permission failure while creating contact." };
+  }
+
+  return { status: "failed", message: `CardDAV create failed with HTTP ${response.status}.` };
+}
+
+function authorizationHeader(connection: ConnectionConfig): string {
+  return `Basic ${Buffer.from(`${connection.username}:${connection.appPassword}`, "utf8").toString("base64")}`;
+}
+
+function importIdentityKey(firstName: string, lastName: string, telephone: string): string {
+  return [firstName, lastName, telephone].join("\u0000");
+}
+
+async function fetchExistingIdentities(
+  addressBook: AddressBook,
+  connection: ConnectionConfig,
+  runtime: CliRuntime,
+): Promise<Set<string> | string> {
+  const fetchImplementation = runtime.fetch ?? fetch;
+  let listingResponse: Response;
+
+  try {
+    listingResponse = await fetchImplementation(new URL(addressBook.url), {
+      method: "PROPFIND",
+      headers: {
+        Authorization: authorizationHeader(connection),
+        Depth: "1",
+        "Content-Type": "application/xml; charset=utf-8",
+      },
+      body: `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:resourcetype /><d:getetag /></d:prop>
+</d:propfind>`,
+    });
+  } catch {
+    return "Network error during CardDAV duplicate check while listing address book contents.";
+  }
+
+  if (listingResponse.status === 401 || listingResponse.status === 403) {
+    return "CardDAV authentication failed. Check the Nextcloud username and app password.";
+  }
+
+  if (listingResponse.status !== 207) {
+    return `CardDAV duplicate check failed while listing address book contents: expected 207 Multi-Status, got HTTP ${listingResponse.status}.`;
+  }
+
+  const listingXml = await listingResponse.text();
+  const contactHrefs = responseBlocks(listingXml)
+    .map((response) => firstHref(response))
+    .filter((href): href is string => href !== undefined && href.toLowerCase().endsWith(".vcf"));
+
+  const identities = new Set<string>();
+
+  for (const href of contactHrefs) {
+    let contactResponse: Response;
+
+    try {
+      contactResponse = await fetchImplementation(new URL(href, new URL(addressBook.url).origin), {
+        method: "GET",
+        headers: { Authorization: authorizationHeader(connection) },
+      });
+    } catch {
+      return "Network error during CardDAV duplicate check while reading an existing contact.";
+    }
+
+    if (contactResponse.status === 401 || contactResponse.status === 403) {
+      return "CardDAV authentication failed. Check the Nextcloud username and app password.";
+    }
+
+    if (contactResponse.status !== 200) {
+      return `CardDAV duplicate check failed while reading an existing contact: got HTTP ${contactResponse.status}.`;
+    }
+
+    for (const identity of parseVcardIdentities(await contactResponse.text())) {
+      identities.add(identity);
+    }
+  }
+
+  return identities;
+}
+
+function parseVcardIdentities(vcard: string): string[] {
+  const unfolded = vcard.replaceAll(/\r\n[ \t]/gu, "").replaceAll(/\n[ \t]/gu, "");
+  const familyNames = parseVcardNameParts(unfolded, 0);
+  const givenNames = parseVcardNameParts(unfolded, 1);
+  const telephones = parseVcardTelephones(unfolded);
+  const displayName = parseVcardProperty(unfolded, "FN");
+
+  if (givenNames.length === 0 || familyNames.length === 0 || telephones.length === 0) {
+    if (displayName === undefined) {
+      return [];
+    }
+
+    return telephones.map((telephone) => importIdentityKey(displayName, "", telephone));
+  }
+
+  const identities: string[] = [];
+
+  for (const givenName of givenNames) {
+    for (const familyName of familyNames) {
+      for (const telephone of telephones) {
+        identities.push(importIdentityKey(givenName, familyName, telephone));
+      }
+    }
+  }
+
+  return identities;
+}
+
+function parseVcardNameParts(vcard: string, partIndex: number): string[] {
+  const names = parseVcardProperty(vcard, "N");
+
+  if (names === undefined) {
+    return [];
+  }
+
+  const part = names.split(";")[partIndex]?.trim() ?? "";
+
+  return part === "" ? [] : [part];
+}
+
+function parseVcardTelephones(vcard: string): string[] {
+  return vcard
+    .split(/\r\n|\n|\r/u)
+    .map((line) => (/^TEL(?:;[^:]*)?:/iu.test(line) ? line.replace(/^TEL(?:;[^:]*)?:/iu, "").trim() : ""))
+    .filter((telephone) => telephone !== "");
+}
+
+function parseVcardProperty(vcard: string, property: string): string | undefined {
+  const match = new RegExp(`^${property}(?:;[^:]*)?:(.*)$`, "imu").exec(vcard);
+  const value = match?.[1]?.trim().replaceAll("\\;", ";").replaceAll("\\,", ",").replaceAll("\\n", "\n").replaceAll("\\N", "\n");
+
+  return value === undefined || value === "" ? undefined : value;
+}
+
+async function writeJsonReport(path: string, report: ImportRunReport, runtime: CliRuntime): Promise<string | undefined> {
+  const writeFile = runtime.writeFile ?? ((filePath: string, contents: string) => fs.writeFile(filePath, contents, "utf8"));
+
+  try {
+    await writeFile(path, `${JSON.stringify(report, null, 2)}\n`);
+    return undefined;
+  } catch {
+    return `Could not write JSON report: ${path}`;
+  }
+}
+
+function renderRunSummary(report: ImportRunReport): string[] {
+  const lines = [
+    report.dryRun ? "Dry run: no contacts were written." : "Import writes completed.",
+    `Created contacts: ${report.created.length}`,
+    `Skipped existing duplicates: ${report.skippedDuplicates.length}`,
+    `Warnings: ${report.warnings.length}`,
+    `Failed writes: ${report.failedWrites.length}`,
+    ...report.warnings,
+  ];
+
+  for (const failedWrite of report.failedWrites) {
+    lines.push(`Failed write on CSV row ${failedWrite.rowNumber}: ${failedWrite.message}`);
+  }
+
+  return lines;
 }
 
 async function validateCsvFile(path: string, runtime: CliRuntime): Promise<CsvValidationResult | string> {
@@ -244,15 +615,15 @@ function validateCsv(contents: string): CsvValidationResult | string {
       return `CSV row ${row.lineNumber} has empty required values: ${emptyHeaders.join(", ")}`;
     }
 
-    const identity = [valuesByHeader.first_name, valuesByHeader.last_name, valuesByHeader.telephone].join("\u0000");
+    const identity = importIdentityKey(valuesByHeader.first_name, valuesByHeader.last_name, valuesByHeader.telephone);
     const firstSeenLine = seenIdentities.get(identity);
 
     if (firstSeenLine !== undefined) {
-      return `Duplicate CSV import identity on rows ${firstSeenLine} and ${row.lineNumber}`;
+      return `Duplicate CSV import identity (first_name, last_name, telephone) on rows ${firstSeenLine} and ${row.lineNumber}`;
     }
 
     seenIdentities.set(identity, row.lineNumber);
-    validRows.push(valuesByHeader);
+    validRows.push({ ...valuesByHeader, rowNumber: row.lineNumber });
 
     if (row.fields.length > parsedHeaderRecord.fields.length) {
       warnings.push(`Warning: ignored ${row.fields.length - parsedHeaderRecord.fields.length} extra value(s) on CSV row ${row.lineNumber}`);
@@ -268,7 +639,7 @@ export function mapCsvRowsToContactPlans(
 ): ContactPlan[] {
   const generatedUids = new Set<string>();
 
-  return rows.map((row) => {
+  return rows.map((row, index) => {
     const uid = generateUid();
 
     if (generatedUids.has(uid)) {
@@ -281,6 +652,7 @@ export function mapCsvRowsToContactPlans(
 
     return {
       operation: "create",
+      rowNumber: row.rowNumber ?? index + 2,
       uid,
       name: {
         givenName: row.first_name,
@@ -686,7 +1058,7 @@ async function propfind(
     response = await fetchImplementation(url, {
       method: "PROPFIND",
       headers: {
-        Authorization: `Basic ${Buffer.from(`${connection.username}:${connection.appPassword}`, "utf8").toString("base64")}`,
+        Authorization: authorizationHeader(connection),
         Depth: depth,
         "Content-Type": "application/xml; charset=utf-8",
       },
@@ -797,7 +1169,13 @@ function parseArgs(args: string[]): ParsedArgs {
     const flag = equalsIndex === -1 ? arg : arg.slice(0, equalsIndex);
     const inlineValue = equalsIndex === -1 ? undefined : arg.slice(equalsIndex + 1);
 
-    if (flag === "--dry-run" || flag === "--yes") {
+    if (flag === "--dry-run") {
+      options.dryRun = true;
+      continue;
+    }
+
+    if (flag === "--yes") {
+      options.yes = true;
       continue;
     }
 
@@ -812,6 +1190,7 @@ function parseArgs(args: string[]): ParsedArgs {
         index += 1;
       }
 
+      options.jsonReport = optionValue;
       continue;
     }
 
@@ -843,7 +1222,7 @@ function isKnownFlag(arg: string): boolean {
   return flag === "--dry-run" || flag === "--yes" || flag === "--json-report" || optionNameForFlag(flag) !== undefined;
 }
 
-function optionNameForFlag(flag: string): keyof CliConnectionOptions | undefined {
+function optionNameForFlag(flag: string): CliStringOptionName | undefined {
   switch (flag) {
     case "--config":
       return "config";
