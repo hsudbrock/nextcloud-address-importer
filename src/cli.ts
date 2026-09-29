@@ -184,7 +184,7 @@ function parseArgs(args: string[]): ParsedArgs {
     if (flag === "--json-report") {
       const optionValue = inlineValue ?? args[index + 1];
 
-      if (optionValue === undefined || optionValue.startsWith("-")) {
+      if (optionValue === undefined || isKnownFlag(optionValue)) {
         return { positionals, options, error: `Missing value for ${flag}` };
       }
 
@@ -203,7 +203,7 @@ function parseArgs(args: string[]): ParsedArgs {
 
     const optionValue = inlineValue ?? args[index + 1];
 
-    if (optionValue === undefined || optionValue.startsWith("-")) {
+    if (optionValue === undefined || isKnownFlag(optionValue)) {
       return { positionals, options, error: `Missing value for ${flag}` };
     }
 
@@ -215,6 +215,12 @@ function parseArgs(args: string[]): ParsedArgs {
   }
 
   return { positionals, options };
+}
+
+function isKnownFlag(arg: string): boolean {
+  const equalsIndex = arg.indexOf("=");
+  const flag = equalsIndex === -1 ? arg : arg.slice(0, equalsIndex);
+  return flag === "--dry-run" || flag === "--yes" || flag === "--json-report" || optionNameForFlag(flag) !== undefined;
 }
 
 function optionNameForFlag(flag: string): keyof CliConnectionOptions | undefined {
@@ -279,7 +285,11 @@ async function resolveConnectionConfig(
   if (appPassword === undefined) {
     if (runtime.isInteractive ?? (process.stdin.isTTY === true && process.stdout.isTTY === true)) {
       const promptHidden = runtime.promptHidden ?? defaultPromptHidden;
-      appPassword = trimToValue(await promptHidden("Nextcloud app password: "));
+      try {
+        appPassword = trimToValue(await promptHidden("Nextcloud app password: "));
+      } catch {
+        return fail("Could not securely read Nextcloud app password. Set NEXTCLOUD_ADDRESS_IMPORTER_APP_PASSWORD or --app-password instead.");
+      }
     }
 
     if (appPassword === undefined) {
@@ -379,7 +389,12 @@ function isMissingFileError(error: unknown): boolean {
 
 async function defaultPromptHidden(prompt: string): Promise<string> {
   process.stdout.write(prompt);
-  spawnSync("stty", ["-echo"], { stdio: ["inherit", "ignore", "ignore"] });
+  const disableEchoResult = spawnSync("stty", ["-echo"], { stdio: ["inherit", "ignore", "ignore"] });
+
+  if (disableEchoResult.status !== 0) {
+    throw new Error("Could not disable terminal echo");
+  }
+
   const readline = createInterface({ input: process.stdin, output: process.stdout });
 
   try {

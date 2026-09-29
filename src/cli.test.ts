@@ -99,6 +99,31 @@ address_book = "Config Contacts"
     expect(result.connection?.appPassword).toBe("secret=with=equals");
   });
 
+  it("accepts separated CLI flag values that start with a hyphen", async () => {
+    const result = await runCli(
+      [
+        "address-books",
+        "--server-url",
+        "https://nextcloud.example.com",
+        "--username",
+        "ada",
+        "--app-password",
+        "-secret",
+      ],
+      { env: {} },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.connection?.appPassword).toBe("-secret");
+  });
+
+  it("still fails when a value-taking flag is followed by another flag", async () => {
+    const result = await runCli(["address-books", "--server-url", "--username", "ada"], { env: {} });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Missing value for --server-url");
+  });
+
   it("uses environment variables before config values", async () => {
     const result = await runCli(["address-books", "--config", "/tmp/config.toml"], {
       env: {
@@ -189,6 +214,22 @@ app_password = 'config-secret'
     expect(promptHidden).toHaveBeenCalledWith("Nextcloud app password: ");
     expect(result.connection?.appPassword).toBe("prompt-secret");
     expect([...result.stdout, ...result.stderr].join("\n")).not.toContain("prompt-secret");
+  });
+
+  it("fails safely when a hidden app password prompt cannot be secured", async () => {
+    const result = await runCli(["address-books"], {
+      env: {
+        NEXTCLOUD_ADDRESS_IMPORTER_SERVER_URL: "https://env.example.com",
+        NEXTCLOUD_ADDRESS_IMPORTER_USERNAME: "env-user",
+      },
+      isInteractive: true,
+      promptHidden: async () => {
+        throw new Error("echo could not be disabled");
+      },
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Could not securely read Nextcloud app password");
   });
 
   it("fails with setup guidance when the app password is missing in non-interactive mode", async () => {
