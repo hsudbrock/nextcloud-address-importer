@@ -23,7 +23,7 @@ export type ConnectionConfig = {
 
 export type CliRuntime = {
   env?: Record<string, string | undefined>;
-  readFile?: (path: string) => Promise<string>;
+  readFile?: (path: string) => Promise<string | Buffer>;
   homeDir?: string;
   isInteractive?: boolean;
   promptHidden?: (prompt: string) => Promise<string>;
@@ -50,7 +50,18 @@ type ParsedArgs = {
   error?: string;
 };
 
+type CsvValidationResult = {
+  rowCount: number;
+  warnings: string[];
+};
+
+type CsvRecord = {
+  fields: string[];
+  lineNumber: number;
+};
+
 const defaultConfigRelativePath = ".config/nextcloud-address-importer/config.toml";
+const requiredCsvHeaders = ["first_name", "last_name", "telephone", "group"] as const;
 
 const usage = `nextcloud-address-importer
 
@@ -123,7 +134,309 @@ Options:
     return connectionResult;
   }
 
-  return ok(`Import command is available. CSV path: ${csvPath}`, connectionResult.connection);
+  const csvValidationResult = await validateCsvFile(csvPath, runtime);
+
+  if (typeof csvValidationResult === "string") {
+    return fail(csvValidationResult);
+  }
+
+  const rowLabel = csvValidationResult.rowCount === 1 ? "contact row" : "contact rows";
+
+  return {
+    exitCode: 0,
+    stdout: [
+      `CSV validation passed: ${csvValidationResult.rowCount} ${rowLabel} ready from ${csvPath}`,
+      ...csvValidationResult.warnings,
+    ],
+    stderr: [],
+    connection: connectionResult.connection,
+  };
+}
+
+async function validateCsvFile(path: string, runtime: CliRuntime): Promise<CsvValidationResult | string> {
+  const readFile = runtime.readFile ?? ((filePath: string) => fs.readFile(filePath));
+  let contents: string | Buffer;
+
+  try {
+    contents = await readFile(path);
+  } catch {
+    return `Could not read CSV file: ${path}`;
+  }
+
+  if (Buffer.isBuffer(contents)) {
+    try {
+      return validateCsv(new TextDecoder("utf-8", { fatal: true }).decode(contents));
+    } catch {
+      return "CSV file is not valid UTF-8.";
+    }
+  }
+
+  return validateCsv(contents);
+}
+
+function validateCsv(contents: string): CsvValidationResult | string {
+  const withoutBom = contents.startsWith("\uFEFF") ? contents.slice(1) : contents;
+  const blankLineCount = countBlankLines(withoutBom);
+  const headerLine = firstNonBlankLine(withoutBom);
+
+  if (headerLine === "") {
+    return "CSV file is empty or only contains blank lines.";
+  }
+
+  const delimiter = detectDelimiter(headerLine);
+
+  if (!isCsvDelimiter(delimiter)) {
+    return delimiter;
+  }
+
+  const parsedRecords = parseCsvRecords(withoutBom, delimiter);
+  const [parsedHeaderRecord, ...parsedRows] = parsedRecords;
+
+  if (parsedHeaderRecord === undefined) {
+    return "CSV file is empty or only contains blank lines.";
+  }
+
+  const headerErrors = validateHeaders(parsedHeaderRecord.fields);
+
+  if (headerErrors.length > 0) {
+    return headerErrors.join("\n");
+  }
+
+  const warnings = warningsForExtraHeaders(parsedHeaderRecord.fields);
+
+  if (blankLineCount > 0) {
+    const lineLabel = blankLineCount === 1 ? "blank line" : "blank lines";
+    warnings.push(`Warning: ignored ${blankLineCount} ${lineLabel}`);
+  }
+
+  const headerIndexes = requiredHeaderIndexes(parsedHeaderRecord.fields);
+  const seenIdentities = new Map<string, number>();
+
+  for (const row of parsedRows) {
+    const valuesByHeader = valuesForRequiredHeaders(row.fields, headerIndexes);
+    const emptyHeaders = requiredCsvHeaders.filter((header) => valuesByHeader[header] === "");
+
+    if (emptyHeaders.length > 0) {
+      return `CSV row ${row.lineNumber} has empty required values: ${emptyHeaders.join(", ")}`;
+    }
+
+    const identity = [valuesByHeader.first_name, valuesByHeader.last_name, valuesByHeader.telephone].join("\u0000");
+    const firstSeenLine = seenIdentities.get(identity);
+
+    if (firstSeenLine !== undefined) {
+      return `Duplicate CSV import identity on rows ${firstSeenLine} and ${row.lineNumber}`;
+    }
+
+    seenIdentities.set(identity, row.lineNumber);
+
+    if (row.fields.length > parsedHeaderRecord.fields.length) {
+      warnings.push(`Warning: ignored ${row.fields.length - parsedHeaderRecord.fields.length} extra value(s) on CSV row ${row.lineNumber}`);
+    }
+  }
+
+  return { rowCount: parsedRows.length, warnings };
+}
+
+function parseCsvRecords(contents: string, delimiter?: "," | ";"): CsvRecord[] {
+  const records: CsvRecord[] = [];
+  let fields: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let lineNumber = 1;
+  let recordStartLine = 1;
+
+  for (let index = 0; index < contents.length; index += 1) {
+    const character = contents[index];
+    const nextCharacter = contents[index + 1];
+
+    if (inQuotes && (character === "\n" || character === "\r")) {
+      field += character === "\r" && nextCharacter === "\n" ? "\n" : character;
+
+      if (character === "\r" && nextCharacter === "\n") {
+        index += 1;
+      }
+
+      lineNumber += 1;
+      continue;
+    }
+
+    if (character === '"') {
+      if (inQuotes && nextCharacter === '"') {
+        field += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (!inQuotes && delimiter !== undefined && character === delimiter) {
+      fields.push(field);
+      field = "";
+      continue;
+    }
+
+    if (!inQuotes && (character === "\n" || character === "\r")) {
+      fields.push(field);
+      pushCsvRecord(records, fields, recordStartLine);
+      fields = [];
+      field = "";
+
+      if (character === "\r" && nextCharacter === "\n") {
+        index += 1;
+      }
+
+      lineNumber += 1;
+      recordStartLine = lineNumber;
+      continue;
+    }
+
+    field += character;
+  }
+
+  fields.push(field);
+  pushCsvRecord(records, fields, recordStartLine);
+
+  return records;
+}
+
+function pushCsvRecord(records: CsvRecord[], fields: string[], lineNumber: number): void {
+  if (fields.every((value) => value.trim() === "")) {
+    return;
+  }
+
+  records.push({ fields: fields.map((value) => value.trim()), lineNumber });
+}
+
+function countBlankLines(contents: string): number {
+  let count = 0;
+  let line = "";
+  let inQuotes = false;
+
+  for (let index = 0; index < contents.length; index += 1) {
+    const character = contents[index];
+    const nextCharacter = contents[index + 1];
+
+    if (character === '"') {
+      if (inQuotes && nextCharacter === '"') {
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      line += character;
+      continue;
+    }
+
+    if (!inQuotes && (character === "\n" || character === "\r")) {
+      if (line.trim() === "") {
+        count += 1;
+      }
+      line = "";
+
+      if (character === "\r" && nextCharacter === "\n") {
+        index += 1;
+      }
+      continue;
+    }
+
+    line += character;
+  }
+
+  return line === "" ? count : count + (line.trim() === "" ? 1 : 0);
+}
+
+function firstNonBlankLine(contents: string): string {
+  return contents.split(/\r\n|\n|\r/u).find((line) => line.trim() !== "") ?? "";
+}
+
+function detectDelimiter(headerLine: string): "," | ";" | string {
+  const commaCount = countUnquotedCharacter(headerLine, ",");
+  const semicolonCount = countUnquotedCharacter(headerLine, ";");
+
+  if (commaCount > 0 && semicolonCount > 0) {
+    return "CSV header mixes comma and semicolon delimiters. Use one delimiter type.";
+  }
+
+  if (commaCount > 0) {
+    return ",";
+  }
+
+  if (semicolonCount > 0) {
+    return ";";
+  }
+
+  return "CSV delimiter could not be detected from the header row. Use comma or semicolon delimiters.";
+}
+
+function isCsvDelimiter(value: string): value is "," | ";" {
+  return value === "," || value === ";";
+}
+
+function countUnquotedCharacter(value: string, target: string): number {
+  let count = 0;
+  let inQuotes = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    const nextCharacter = value[index + 1];
+
+    if (character === '"') {
+      if (inQuotes && nextCharacter === '"') {
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (!inQuotes && character === target) {
+      count += 1;
+    }
+  }
+
+  return count;
+}
+
+function validateHeaders(headers: string[]): string[] {
+  const errors: string[] = [];
+  const missingHeaders = requiredCsvHeaders.filter((header) => !headers.includes(header));
+  const duplicatedHeaders = requiredCsvHeaders.filter((header) => headers.filter((candidate) => candidate === header).length > 1);
+
+  if (missingHeaders.length > 0) {
+    errors.push(`Missing required CSV headers: ${missingHeaders.join(", ")}`);
+  }
+
+  if (duplicatedHeaders.length > 0) {
+    errors.push(`Duplicated required CSV headers: ${duplicatedHeaders.join(", ")}`);
+  }
+
+  return errors;
+}
+
+function warningsForExtraHeaders(headers: string[]): string[] {
+  const extraHeaders = headers.filter((header) => !requiredCsvHeaders.includes(header as (typeof requiredCsvHeaders)[number]));
+  return extraHeaders.length === 0 ? [] : [`Warning: ignored extra CSV columns: ${extraHeaders.join(", ")}`];
+}
+
+function requiredHeaderIndexes(headers: string[]): Record<(typeof requiredCsvHeaders)[number], number> {
+  return {
+    first_name: headers.indexOf("first_name"),
+    last_name: headers.indexOf("last_name"),
+    telephone: headers.indexOf("telephone"),
+    group: headers.indexOf("group"),
+  };
+}
+
+function valuesForRequiredHeaders(
+  fields: string[],
+  headerIndexes: Record<(typeof requiredCsvHeaders)[number], number>,
+): Record<(typeof requiredCsvHeaders)[number], string> {
+  return {
+    first_name: fields[headerIndexes.first_name]?.trim() ?? "",
+    last_name: fields[headerIndexes.last_name]?.trim() ?? "",
+    telephone: fields[headerIndexes.telephone]?.trim() ?? "",
+    group: fields[headerIndexes.group]?.trim() ?? "",
+  };
 }
 
 async function runAddressBooksShell(args: string[], runtime: CliRuntime): Promise<CliResult> {
@@ -320,7 +633,8 @@ async function readConfigFile(
   const readFile = runtime.readFile ?? ((filePath: string) => fs.readFile(filePath, "utf8"));
 
   try {
-    return { config: parseTomlConfig(await readFile(path)) };
+    const contents = await readFile(path);
+    return { config: parseTomlConfig(Buffer.isBuffer(contents) ? contents.toString("utf8") : contents) };
   } catch (error) {
     if (isMissingFileError(error) && !explicitPath) {
       return { config: {} };

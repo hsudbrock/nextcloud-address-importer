@@ -1,6 +1,31 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.js";
+import type { CliRuntime } from "./cli.js";
+
+const validConnectionEnv = {
+  NEXTCLOUD_ADDRESS_IMPORTER_SERVER_URL: "https://nextcloud.example.com",
+  NEXTCLOUD_ADDRESS_IMPORTER_USERNAME: "ada",
+  NEXTCLOUD_ADDRESS_IMPORTER_APP_PASSWORD: "env-secret",
+};
+
+const validCsv = `first_name,last_name,telephone,group
+Ada,Lovelace,+44 20 0000 0000,Friends
+Grace,Hopper,+1 555 0100,Work
+`;
+
+function importRuntime(csv: string): CliRuntime {
+  return {
+    env: validConnectionEnv,
+    readFile: async (path) => {
+      if (path === "contacts.csv") {
+        return csv;
+      }
+
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    },
+  };
+}
 
 describe("runCli", () => {
   it("shows top-level help", async () => {
@@ -11,16 +36,135 @@ describe("runCli", () => {
   });
 
   it("exposes the import command shell", async () => {
+    const result = await runCli(["import", "contacts.csv"], importRuntime(validCsv));
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("CSV validation passed: 2 contact rows ready from contacts.csv");
+  });
+
+  it("accepts semicolon-separated CSV and quoted delimiters", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime(`telephone;group;last_name;first_name
+"+44;20";Friends;Lovelace;Ada
+"+1,555";Work;Hopper;Grace
+`),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("CSV validation passed: 2 contact rows ready from contacts.csv");
+  });
+
+  it("accepts a UTF-8 BOM and reports ignored blank lines", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime(`\ufefffirst_name,last_name,telephone,group
+
+Ada,Lovelace,+44 20 0000 0000,Friends
+`),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("CSV validation passed: 1 contact row ready from contacts.csv");
+    expect(result.stdout).toContain("Warning: ignored 1 blank line");
+  });
+
+  it("warns about extra CSV columns without failing", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime(`first_name,last_name,telephone,group,"notes;private"
+Ada,Lovelace,+44 20 0000 0000,Friends,ignored
+`),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Warning: ignored extra CSV columns: notes;private");
+  });
+
+  it("fails on mixed delimiter usage in the header", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime("first_name,last_name;telephone,group\nAda,Lovelace,+44 20 0000 0000,Friends\n"),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("CSV header mixes comma and semicolon delimiters");
+  });
+
+  it("fails on missing and duplicated required headers", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime("first_name,last_name,telephone,telephone\nAda,Lovelace,+44 20 0000 0000,+44 20 0000 0000\n"),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Missing required CSV headers: group");
+    expect(result.stderr.join("\n")).toContain("Duplicated required CSV headers: telephone");
+  });
+
+  it("fails on empty required values after trimming", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime("first_name,last_name,telephone,group\nAda,  ,+44 20 0000 0000,Friends\n"),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("CSV row 2 has empty required values: last_name");
+  });
+
+  it("fails on duplicate CSV import identities", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime(`first_name,last_name,telephone,group
+Ada,Lovelace,+44 20 0000 0000,Friends
+Ada,Lovelace,+44 20 0000 0000,Work
+`),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Duplicate CSV import identity on rows 2 and 3");
+  });
+
+  it("accepts a valid literal replacement character in CSV text", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime("first_name,last_name,telephone,group\nAda,Lovelace,�,Friends\n"),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("CSV validation passed: 1 contact row ready from contacts.csv");
+  });
+
+  it("fails when CSV bytes are invalid UTF-8", async () => {
     const result = await runCli(["import", "contacts.csv"], {
-      env: {
-        NEXTCLOUD_ADDRESS_IMPORTER_SERVER_URL: "https://nextcloud.example.com",
-        NEXTCLOUD_ADDRESS_IMPORTER_USERNAME: "ada",
-        NEXTCLOUD_ADDRESS_IMPORTER_APP_PASSWORD: "env-secret",
+      env: validConnectionEnv,
+      readFile: async (path) => {
+        if (path === "contacts.csv") {
+          return Buffer.from([0xff]);
+        }
+
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
       },
     });
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("Import command is available. CSV path: contacts.csv");
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("CSV file is not valid UTF-8");
+  });
+
+  it("does not report quoted blank physical lines as ignored CSV rows", async () => {
+    const result = await runCli(
+      ["import", "contacts.csv"],
+      importRuntime(`first_name,last_name,telephone,group
+Ada,"Love
+
+lace",+44 20 0000 0000,Friends
+Grace,  ,+1 555 0100,Work
+`),
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("CSV row 5 has empty required values: last_name");
+    expect(result.stdout.join("\n")).not.toContain("ignored");
   });
 
   it("exposes the address-books command shell", async () => {
