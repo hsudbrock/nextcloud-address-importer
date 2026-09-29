@@ -52,6 +52,29 @@ function emptyAddressBookContentsXml(): string {
 </d:multistatus>`;
 }
 
+function addressBookWithExistingContactXml(): string {
+  return `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/</d:href>
+    <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/existing.vcf</d:href>
+    <d:propstat><d:prop><d:getetag>"abc123"</d:getetag></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`;
+}
+
+function existingContactVcardResponse(): Response {
+  return new Response(
+    ["BEGIN:VCARD", "VERSION:3.0", "UID:existing", "N:Lovelace;Ada;;;", "FN:Ada Lovelace", "TEL:+44 20 0000 0000", "END:VCARD", ""].join(
+      "\r\n",
+    ),
+    { status: 200 },
+  );
+}
+
 function successfulImportFetch(addressBooksXml = addressBookListXml()): ReturnType<typeof vi.fn<typeof fetch>> {
   return successfulCardDavFetch(addressBooksXml)
     .mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()))
@@ -246,27 +269,8 @@ Ada,Lovelace,+44 20 0000 0000,Work
 
   it("skips existing Nextcloud duplicates without failing", async () => {
     const fetch = successfulCardDavFetch()
-      .mockResolvedValueOnce(
-        xmlResponse(`<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/</d:href>
-    <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/existing.vcf</d:href>
-    <d:propstat><d:prop><d:getetag>"abc123"</d:getetag></d:prop></d:propstat>
-  </d:response>
-</d:multistatus>`),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          ["BEGIN:VCARD", "VERSION:3.0", "UID:existing", "N:Lovelace;Ada;;;", "FN:Ada Lovelace", "TEL:+44 20 0000 0000", "END:VCARD", ""].join(
-            "\r\n",
-          ),
-          { status: 200 },
-        ),
-      )
+      .mockResolvedValueOnce(xmlResponse(addressBookWithExistingContactXml()))
+      .mockResolvedValueOnce(existingContactVcardResponse())
       .mockResolvedValue(new Response("", { status: 201 }));
 
     const result = await runCli(["import", "contacts.csv"], {
@@ -277,31 +281,13 @@ Ada,Lovelace,+44 20 0000 0000,Work
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Created contacts: 1");
     expect(result.stdout).toContain("Skipped existing duplicates: 1");
+    expect(result.stdout).toContain("Skipped existing duplicate on CSV row 2");
   });
 
   it("reports existing duplicates during dry runs", async () => {
     const fetch = successfulCardDavFetch()
-      .mockResolvedValueOnce(
-        xmlResponse(`<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:">
-  <d:response>
-    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/</d:href>
-    <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
-  </d:response>
-  <d:response>
-    <d:href>/remote.php/dav/addressbooks/users/ada/contacts/existing.vcf</d:href>
-    <d:propstat><d:prop><d:getetag>"abc123"</d:getetag></d:prop></d:propstat>
-  </d:response>
-</d:multistatus>`),
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          ["BEGIN:VCARD", "VERSION:3.0", "UID:existing", "N:Lovelace;Ada;;;", "FN:Ada Lovelace", "TEL:+44 20 0000 0000", "END:VCARD", ""].join(
-            "\r\n",
-          ),
-          { status: 200 },
-        ),
-      );
+      .mockResolvedValueOnce(xmlResponse(addressBookWithExistingContactXml()))
+      .mockResolvedValueOnce(existingContactVcardResponse());
 
     const result = await runCli(["import", "contacts.csv", "--dry-run"], {
       ...importRuntime(validCsv),
@@ -312,7 +298,24 @@ Ada,Lovelace,+44 20 0000 0000,Work
     expect(result.stdout).toContain("Dry run: no contacts were written.");
     expect(result.stdout).toContain("Created contacts: 1");
     expect(result.stdout).toContain("Skipped existing duplicates: 1");
+    expect(result.stdout).toContain("Skipped existing duplicate on CSV row 2");
     expect(fetch).toHaveBeenCalledTimes(5);
+  });
+
+  it("reports CardDAV create conflicts as failed writes", async () => {
+    const fetch = successfulCardDavFetch()
+      .mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()))
+      .mockResolvedValue(new Response("conflict", { status: 412 }));
+
+    const result = await runCli(["import", "contacts.csv"], {
+      ...importRuntime(validCsv),
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout).toContain("Created contacts: 0");
+    expect(result.stdout).toContain("Failed writes: 2");
+    expect(result.stdout.join("\n")).toContain("Failed write on CSV row 2: CardDAV create conflict");
   });
 
   it("fails when CSV bytes are invalid UTF-8", async () => {

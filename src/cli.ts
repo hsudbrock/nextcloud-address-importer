@@ -254,30 +254,43 @@ function selectImportAddressBook(addressBooks: AddressBook[], connection: Connec
   return "Multiple address books were discovered. Set --address-book because non-interactive import cannot prompt for a selection.";
 }
 
-type PutResult =
-  | { status: "created" }
-  | { status: "duplicate" }
-  | { status: "failed"; message: string };
+type PutResult = { status: "created" } | { status: "failed"; message: string };
 
-function planDryRun(contactPlans: ContactPlan[], existingIdentities: Set<string>, warnings: string[]): ImportRunReport {
-  const report: ImportRunReport = {
-    status: "success",
-    dryRun: true,
-    created: [],
-    skippedDuplicates: [],
-    warnings,
-    failedWrites: [],
-  };
+type ImportContext = {
+  addressBook: AddressBook;
+  connection: ConnectionConfig;
+  runtime: CliRuntime;
+};
+
+function partitionContactPlans(
+  contactPlans: ContactPlan[],
+  existingIdentities: Set<string>,
+): { toCreate: ContactPlan[]; skippedDuplicates: Array<{ rowNumber: number }> } {
+  const toCreate: ContactPlan[] = [];
+  const skippedDuplicates: Array<{ rowNumber: number }> = [];
 
   for (const contactPlan of contactPlans) {
     if (existingIdentities.has(importIdentityKey(contactPlan.name.givenName, contactPlan.name.familyName, contactPlan.telephone))) {
-      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
+      skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
     } else {
-      report.created.push({ rowNumber: contactPlan.rowNumber });
+      toCreate.push(contactPlan);
     }
   }
 
-  return report;
+  return { toCreate, skippedDuplicates };
+}
+
+function planDryRun(contactPlans: ContactPlan[], existingIdentities: Set<string>, warnings: string[]): ImportRunReport {
+  const { toCreate, skippedDuplicates } = partitionContactPlans(contactPlans, existingIdentities);
+
+  return {
+    status: "success",
+    dryRun: true,
+    created: toCreate.map((contactPlan) => ({ rowNumber: contactPlan.rowNumber })),
+    skippedDuplicates,
+    warnings,
+    failedWrites: [],
+  };
 }
 
 async function createContacts(
@@ -288,27 +301,22 @@ async function createContacts(
   warnings: string[],
   runtime: CliRuntime,
 ): Promise<ImportRunReport> {
+  const { toCreate, skippedDuplicates } = partitionContactPlans(contactPlans, existingIdentities);
+  const context: ImportContext = { addressBook, connection, runtime };
   const report: ImportRunReport = {
     status: "success",
     dryRun: false,
     created: [],
-    skippedDuplicates: [],
+    skippedDuplicates,
     warnings,
     failedWrites: [],
   };
 
-  for (const contactPlan of contactPlans) {
-    if (existingIdentities.has(importIdentityKey(contactPlan.name.givenName, contactPlan.name.familyName, contactPlan.telephone))) {
-      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
-      continue;
-    }
-
-    const writeResult = await putContactWithRetry(addressBook, connection, contactPlan, runtime);
+  for (const contactPlan of toCreate) {
+    const writeResult = await putContactWithRetry(context, contactPlan);
 
     if (writeResult.status === "created") {
       report.created.push({ rowNumber: contactPlan.rowNumber });
-    } else if (writeResult.status === "duplicate") {
-      report.skippedDuplicates.push({ rowNumber: contactPlan.rowNumber });
     } else {
       report.failedWrites.push({ rowNumber: contactPlan.rowNumber, message: writeResult.message });
     }
@@ -321,50 +329,29 @@ async function createContacts(
   return report;
 }
 
-async function putContactWithRetry(
-  addressBook: AddressBook,
-  connection: ConnectionConfig,
-  contactPlan: ContactPlan,
-  runtime: CliRuntime,
-): Promise<PutResult> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const result = await putContact(addressBook, connection, contactPlan, runtime);
+async function putContactWithRetry(context: ImportContext, contactPlan: ContactPlan): Promise<PutResult> {
+  const firstAttempt = await putContact(context, contactPlan);
 
-    if (result.status !== "failed" || !isRetryablePutFailure(result.message)) {
-      return result;
-    }
-
-    if (attempt === 1) {
-      return result;
-    }
+  if (firstAttempt.status === "created") {
+    return firstAttempt;
   }
 
-  return { status: "failed", message: "CardDAV create failed after retry." };
+  return putContact(context, contactPlan);
 }
 
-function isRetryablePutFailure(message: string): boolean {
-  return (
-    message.startsWith("Network error") ||
-    message.startsWith("CardDAV create failed with HTTP 5") ||
-    message.startsWith("CardDAV create failed with HTTP 429")
+async function putContact(context: ImportContext, contactPlan: ContactPlan): Promise<PutResult> {
+  const fetchImplementation = context.runtime.fetch ?? fetch;
+  const url = new URL(
+    `${encodeURIComponent(contactPlan.uid)}.vcf`,
+    context.addressBook.url.endsWith("/") ? context.addressBook.url : `${context.addressBook.url}/`,
   );
-}
-
-async function putContact(
-  addressBook: AddressBook,
-  connection: ConnectionConfig,
-  contactPlan: ContactPlan,
-  runtime: CliRuntime,
-): Promise<PutResult> {
-  const fetchImplementation = runtime.fetch ?? fetch;
-  const url = new URL(`${encodeURIComponent(contactPlan.uid)}.vcf`, addressBook.url.endsWith("/") ? addressBook.url : `${addressBook.url}/`);
   let response: Response;
 
   try {
     response = await fetchImplementation(url, {
       method: "PUT",
       headers: {
-        Authorization: authorizationHeader(connection),
+        Authorization: authorizationHeader(context.connection),
         "Content-Type": "text/vcard; charset=utf-8",
         "If-None-Match": "*",
       },
@@ -379,7 +366,7 @@ async function putContact(
   }
 
   if (response.status === 412) {
-    return { status: "duplicate" };
+    return { status: "failed", message: "CardDAV create conflict: the contact resource already exists." };
   }
 
   if (response.status === 401 || response.status === 403) {
@@ -422,8 +409,10 @@ async function fetchExistingIdentities(
     return "Network error during CardDAV duplicate check while listing address book contents.";
   }
 
-  if (listingResponse.status === 401 || listingResponse.status === 403) {
-    return "CardDAV authentication failed. Check the Nextcloud username and app password.";
+  const listingAuthError = cardDavAuthError(listingResponse.status);
+
+  if (listingAuthError !== undefined) {
+    return listingAuthError;
   }
 
   if (listingResponse.status !== 207) {
@@ -449,8 +438,10 @@ async function fetchExistingIdentities(
       return "Network error during CardDAV duplicate check while reading an existing contact.";
     }
 
-    if (contactResponse.status === 401 || contactResponse.status === 403) {
-      return "CardDAV authentication failed. Check the Nextcloud username and app password.";
+    const contactAuthError = cardDavAuthError(contactResponse.status);
+
+    if (contactAuthError !== undefined) {
+      return contactAuthError;
     }
 
     if (contactResponse.status !== 200) {
@@ -465,19 +456,22 @@ async function fetchExistingIdentities(
   return identities;
 }
 
+function cardDavAuthError(status: number): string | undefined {
+  if (status === 401 || status === 403) {
+    return "CardDAV authentication failed. Check the Nextcloud username and app password.";
+  }
+
+  return undefined;
+}
+
 function parseVcardIdentities(vcard: string): string[] {
   const unfolded = vcard.replaceAll(/\r\n[ \t]/gu, "").replaceAll(/\n[ \t]/gu, "");
-  const familyNames = parseVcardNameParts(unfolded, 0);
-  const givenNames = parseVcardNameParts(unfolded, 1);
+  const familyNames = parseVcardFamilyNames(unfolded);
+  const givenNames = parseVcardGivenNames(unfolded);
   const telephones = parseVcardTelephones(unfolded);
-  const displayName = parseVcardProperty(unfolded, "FN");
 
   if (givenNames.length === 0 || familyNames.length === 0 || telephones.length === 0) {
-    if (displayName === undefined) {
-      return [];
-    }
-
-    return telephones.map((telephone) => importIdentityKey(displayName, "", telephone));
+    return [];
   }
 
   const identities: string[] = [];
@@ -493,7 +487,15 @@ function parseVcardIdentities(vcard: string): string[] {
   return identities;
 }
 
-function parseVcardNameParts(vcard: string, partIndex: number): string[] {
+function parseVcardFamilyNames(vcard: string): string[] {
+  return parseVcardNamePart(vcard, 0);
+}
+
+function parseVcardGivenNames(vcard: string): string[] {
+  return parseVcardNamePart(vcard, 1);
+}
+
+function parseVcardNamePart(vcard: string, partIndex: number): string[] {
   const names = parseVcardProperty(vcard, "N");
 
   if (names === undefined) {
@@ -539,6 +541,10 @@ function renderRunSummary(report: ImportRunReport): string[] {
     `Failed writes: ${report.failedWrites.length}`,
     ...report.warnings,
   ];
+
+  for (const skipped of report.skippedDuplicates) {
+    lines.push(`Skipped existing duplicate on CSV row ${skipped.rowNumber}`);
+  }
 
   for (const failedWrite of report.failedWrites) {
     lines.push(`Failed write on CSV row ${failedWrite.rowNumber}: ${failedWrite.message}`);
