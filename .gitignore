@@ -3,3 +3,5 @@ config.toml
 node_modules/
 dist/
 coverage/
+.agent-trace/
+.opencode-trace/
