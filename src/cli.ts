@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
@@ -19,6 +20,19 @@ export type ConnectionConfig = {
   username: string;
   appPassword: string;
   addressBook?: string;
+};
+
+export type ContactPlan = {
+  operation: "create";
+  uid: string;
+  name: {
+    givenName: string;
+    familyName: string;
+  };
+  displayName: string;
+  telephone: string;
+  categories: [string];
+  vcard: string;
 };
 
 export type CliRuntime = {
@@ -53,12 +67,15 @@ type ParsedArgs = {
 type CsvValidationResult = {
   rowCount: number;
   warnings: string[];
+  contactPlans: ContactPlan[];
 };
 
 type CsvRecord = {
   fields: string[];
   lineNumber: number;
 };
+
+type CsvRowValues = Record<(typeof requiredCsvHeaders)[number], string>;
 
 const defaultConfigRelativePath = ".config/nextcloud-address-importer/config.toml";
 const requiredCsvHeaders = ["first_name", "last_name", "telephone", "group"] as const;
@@ -211,6 +228,7 @@ function validateCsv(contents: string): CsvValidationResult | string {
 
   const headerIndexes = requiredHeaderIndexes(parsedHeaderRecord.fields);
   const seenIdentities = new Map<string, number>();
+  const validRows: CsvRowValues[] = [];
 
   for (const row of parsedRows) {
     const valuesByHeader = valuesForRequiredHeaders(row.fields, headerIndexes);
@@ -228,13 +246,86 @@ function validateCsv(contents: string): CsvValidationResult | string {
     }
 
     seenIdentities.set(identity, row.lineNumber);
+    validRows.push(valuesByHeader);
 
     if (row.fields.length > parsedHeaderRecord.fields.length) {
       warnings.push(`Warning: ignored ${row.fields.length - parsedHeaderRecord.fields.length} extra value(s) on CSV row ${row.lineNumber}`);
     }
   }
 
-  return { rowCount: parsedRows.length, warnings };
+  return { rowCount: parsedRows.length, warnings, contactPlans: mapCsvRowsToContactPlans(validRows) };
+}
+
+export function mapCsvRowsToContactPlans(
+  rows: CsvRowValues[],
+  generateUid: () => string = randomUUID,
+): ContactPlan[] {
+  const generatedUids = new Set<string>();
+
+  return rows.map((row) => {
+    const uid = generateUid();
+
+    if (generatedUids.has(uid)) {
+      throw new Error(`Generated duplicate vCard UID: ${uid}`);
+    }
+
+    generatedUids.add(uid);
+
+    const displayName = `${row.first_name} ${row.last_name}`;
+
+    return {
+      operation: "create",
+      uid,
+      name: {
+        givenName: row.first_name,
+        familyName: row.last_name,
+      },
+      displayName,
+      telephone: row.telephone,
+      categories: [row.group],
+      vcard: renderContactVcard({
+        uid,
+        givenName: row.first_name,
+        familyName: row.last_name,
+        displayName,
+        telephone: row.telephone,
+        category: row.group,
+      }),
+    };
+  });
+}
+
+function renderContactVcard(contact: {
+  uid: string;
+  givenName: string;
+  familyName: string;
+  displayName: string;
+  telephone: string;
+  category: string;
+}): string {
+  return [
+    "BEGIN:VCARD",
+    "VERSION:3.0",
+    `UID:${escapeVcardText(contact.uid)}`,
+    `N:${escapeVcardText(contact.familyName)};${escapeVcardText(contact.givenName)};;;`,
+    `FN:${escapeVcardText(contact.displayName)}`,
+    `TEL:${escapeVcardPhoneNumber(contact.telephone)}`,
+    `CATEGORIES:${escapeVcardText(contact.category)}`,
+    "END:VCARD",
+    "",
+  ].join("\r\n");
+}
+
+function escapeVcardPhoneNumber(value: string): string {
+  return value.replaceAll("\r\n", "\\n").replaceAll("\r", "\\n").replaceAll("\n", "\\n");
+}
+
+function escapeVcardText(value: string): string {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("\n", "\\n")
+    .replaceAll(";", "\\;")
+    .replaceAll(",", "\\,");
 }
 
 function parseCsvRecords(contents: string, delimiter?: "," | ";"): CsvRecord[] {
@@ -430,7 +521,7 @@ function requiredHeaderIndexes(headers: string[]): Record<(typeof requiredCsvHea
 function valuesForRequiredHeaders(
   fields: string[],
   headerIndexes: Record<(typeof requiredCsvHeaders)[number], number>,
-): Record<(typeof requiredCsvHeaders)[number], string> {
+): CsvRowValues {
   return {
     first_name: fields[headerIndexes.first_name]?.trim() ?? "",
     last_name: fields[headerIndexes.last_name]?.trim() ?? "",

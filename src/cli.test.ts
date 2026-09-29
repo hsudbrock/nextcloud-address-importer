@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { runCli } from "./cli.js";
+import { mapCsvRowsToContactPlans, runCli } from "./cli.js";
 import type { CliRuntime } from "./cli.js";
 
 const validConnectionEnv = {
@@ -399,5 +399,97 @@ app_password = 'config-secret'
     expect(result.exitCode).toBe(1);
     expect(result.stderr.join("\n")).toContain("Invalid config file: /tmp/config.toml");
     expect(result.stderr.join("\n")).not.toContain("config-secret");
+  });
+});
+
+describe("mapCsvRowsToContactPlans", () => {
+  it("maps CSV rows to create-only contact plans with vCard output", () => {
+    const plans = mapCsvRowsToContactPlans(
+      [
+        {
+          first_name: "Ada",
+          last_name: "Lovelace",
+          telephone: "+44 20 0000 0000",
+          group: "Friends",
+        },
+        {
+          first_name: "Grace",
+          last_name: "Hopper",
+          telephone: "+1 555 0100",
+          group: "Work",
+        },
+      ],
+      vi.fn().mockReturnValueOnce("uid-ada").mockReturnValueOnce("uid-grace"),
+    );
+
+    expect(plans).toHaveLength(2);
+    expect(plans[0]).toMatchObject({
+      operation: "create",
+      uid: "uid-ada",
+      name: {
+        givenName: "Ada",
+        familyName: "Lovelace",
+      },
+      displayName: "Ada Lovelace",
+      telephone: "+44 20 0000 0000",
+      categories: ["Friends"],
+    });
+    expect(plans[0]?.vcard).toBe(
+      [
+        "BEGIN:VCARD",
+        "VERSION:3.0",
+        "UID:uid-ada",
+        "N:Lovelace;Ada;;;",
+        "FN:Ada Lovelace",
+        "TEL:+44 20 0000 0000",
+        "CATEGORIES:Friends",
+        "END:VCARD",
+        "",
+      ].join("\r\n"),
+    );
+    expect(plans.map((plan) => plan.uid)).toEqual(["uid-ada", "uid-grace"]);
+  });
+
+  it("escapes vCard text while preserving telephone text", () => {
+    const [plan] = mapCsvRowsToContactPlans(
+      [
+        {
+          first_name: "A,da",
+          last_name: "Love;lace",
+          telephone: "+44;20,0000\\main",
+          group: "Friends, Family",
+        },
+      ],
+      () => "uid-escaped",
+    );
+
+    expect(plan?.telephone).toBe("+44;20,0000\\main");
+    expect(plan?.categories).toEqual(["Friends, Family"]);
+    expect(plan?.vcard).toContain("N:Love\\;lace;A\\,da;;;");
+    expect(plan?.vcard).toContain("FN:A\\,da Love\\;lace");
+    expect(plan?.vcard).toContain("TEL:+44;20,0000\\main");
+    expect(plan?.vcard).toContain("CATEGORIES:Friends\\, Family");
+  });
+
+  it("fails if generated vCard UIDs are not unique", () => {
+    expect(() =>
+      mapCsvRowsToContactPlans(
+        [
+          {
+            first_name: "Ada",
+            last_name: "Lovelace",
+            telephone: "+44 20 0000 0000",
+            group: "Friends",
+          },
+          {
+            first_name: "Grace",
+            last_name: "Hopper",
+            telephone: "+1 555 0100",
+            group: "Work",
+          },
+        ],
+        () => "duplicate-uid",
+      ),
+    ).toThrow("Generated duplicate vCard UID: duplicate-uid");
   });
 });
