@@ -38,9 +38,15 @@ export type ContactPlan = {
 export type CliRuntime = {
   env?: Record<string, string | undefined>;
   readFile?: (path: string) => Promise<string | Buffer>;
+  fetch?: typeof fetch;
   homeDir?: string;
   isInteractive?: boolean;
   promptHidden?: (prompt: string) => Promise<string>;
+};
+
+export type AddressBook = {
+  displayName: string;
+  url: string;
 };
 
 type ConfigFileValues = {
@@ -558,7 +564,217 @@ Options:
     return connectionResult;
   }
 
-  return ok("Address book discovery command is available.", connectionResult.connection);
+  const connection = connectionResult.connection;
+
+  if (connection === undefined) {
+    return fail("Connection configuration could not be resolved.");
+  }
+
+  const discoveryResult = await discoverAddressBooks(connection, runtime);
+
+  if (typeof discoveryResult === "string") {
+    return fail(discoveryResult);
+  }
+
+  if (connection.addressBook !== undefined) {
+    const selectionResult = selectAddressBook(discoveryResult, connection.addressBook);
+
+    if (typeof selectionResult === "string") {
+      return fail(selectionResult);
+    }
+  }
+
+  return {
+    exitCode: 0,
+    stdout: discoveryResult.map((addressBook) => `${addressBook.displayName}\t${addressBook.url}`),
+    stderr: [],
+    connection,
+  };
+}
+
+async function discoverAddressBooks(connection: ConnectionConfig, runtime: CliRuntime): Promise<AddressBook[] | string> {
+  const davBaseUrl = new URL("/remote.php/dav/", normalizedServerUrl(connection.serverUrl));
+  const principalResponse = await propfind(
+    davBaseUrl,
+    connection,
+    runtime,
+    "0",
+    `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:current-user-principal /></d:prop>
+</d:propfind>`,
+    "discover current user principal",
+  );
+
+  if (principalResponse.error !== undefined) {
+    return principalResponse.error;
+  }
+
+  const principalHref = propertyValue(principalResponse.body, "current-user-principal");
+
+  if (principalHref === undefined) {
+    return "CardDAV discovery failed: current user principal was not returned.";
+  }
+
+  const homeSetResponse = await propfind(
+    resolveDavHref(principalHref, davBaseUrl),
+    connection,
+    runtime,
+    "0",
+    `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><card:addressbook-home-set /></d:prop>
+</d:propfind>`,
+    "discover address book home set",
+  );
+
+  if (homeSetResponse.error !== undefined) {
+    return homeSetResponse.error;
+  }
+
+  const addressBookHomeHref = propertyValue(homeSetResponse.body, "addressbook-home-set");
+
+  if (addressBookHomeHref === undefined) {
+    return "CardDAV discovery failed: address book home set was not returned.";
+  }
+
+  const addressBooksResponse = await propfind(
+    resolveDavHref(addressBookHomeHref, davBaseUrl),
+    connection,
+    runtime,
+    "1",
+    `<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:displayname /><d:resourcetype /></d:prop>
+</d:propfind>`,
+    "list address books",
+  );
+
+  if (addressBooksResponse.error !== undefined) {
+    return addressBooksResponse.error;
+  }
+
+  const addressBooks = responseBlocks(addressBooksResponse.body)
+    .filter((response) => /<[^>]*:?addressbook(?:\s|>|\/)/u.test(response))
+    .map((response) => {
+      const href = firstHref(response);
+      const url = href === undefined ? undefined : resolveDavHref(href, davBaseUrl).href;
+      const displayName = propertyText(response, "displayname") ?? (url === undefined ? undefined : lastUrlSegment(url));
+      return url === undefined || displayName === undefined ? undefined : { displayName, url };
+    })
+    .filter((addressBook): addressBook is AddressBook => addressBook !== undefined);
+
+  if (addressBooks.length === 0) {
+    return "CardDAV discovery failed: no address books were returned.";
+  }
+
+  return addressBooks;
+}
+
+async function propfind(
+  url: URL,
+  connection: ConnectionConfig,
+  runtime: CliRuntime,
+  depth: "0" | "1",
+  body: string,
+  action: string,
+): Promise<{ body: string; error?: undefined } | { body?: undefined; error: string }> {
+  const fetchImplementation = runtime.fetch ?? fetch;
+  let response: Response;
+
+  try {
+    response = await fetchImplementation(url, {
+      method: "PROPFIND",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${connection.username}:${connection.appPassword}`, "utf8").toString("base64")}`,
+        Depth: depth,
+        "Content-Type": "application/xml; charset=utf-8",
+      },
+      body,
+    });
+  } catch {
+    return { error: `Network error during CardDAV discovery while trying to ${action}.` };
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    return { error: "CardDAV authentication failed. Check the Nextcloud username and app password." };
+  }
+
+  if (response.status !== 207) {
+    return { error: `CardDAV discovery failed while trying to ${action}: expected 207 Multi-Status, got HTTP ${response.status}.` };
+  }
+
+  return { body: await response.text() };
+}
+
+function selectAddressBook(addressBooks: AddressBook[], configuredAddressBook: string): AddressBook | string {
+  const normalizedConfiguredValue = normalizeAddressBookSelector(configuredAddressBook);
+  const matches = addressBooks.filter(
+    (addressBook) =>
+      addressBook.displayName === configuredAddressBook ||
+      normalizeAddressBookSelector(addressBook.url) === normalizedConfiguredValue ||
+      normalizeAddressBookSelector(new URL(addressBook.url).pathname) === normalizedConfiguredValue,
+  );
+
+  if (matches.length === 0) {
+    return `Configured address book was not found after discovery: ${configuredAddressBook}`;
+  }
+
+  if (matches.length > 1) {
+    return `Configured address book is ambiguous after discovery: ${configuredAddressBook}`;
+  }
+
+  return matches[0] ?? "Configured address book was not found after discovery.";
+}
+
+function normalizedServerUrl(serverUrl: string): URL {
+  const url = new URL(serverUrl);
+  url.pathname = url.pathname.replace(/\/$/u, "");
+  return url;
+}
+
+function resolveDavHref(href: string, baseUrl: URL): URL {
+  return new URL(href, baseUrl.origin);
+}
+
+function responseBlocks(xml: string): string[] {
+  return Array.from(xml.matchAll(/<[^>]*:?response\b[\s\S]*?<\/[^>]*:?response>/giu), (match) => match[0]);
+}
+
+function firstHref(xml: string): string | undefined {
+  return propertyText(xml, "href");
+}
+
+function propertyValue(xml: string, propertyName: string): string | undefined {
+  const propertyXml = propertyXmlBlock(xml, propertyName);
+  return propertyXml === undefined ? undefined : firstHref(propertyXml);
+}
+
+function propertyText(xml: string, propertyName: string): string | undefined {
+  const match = new RegExp(`<[^>]*:?${propertyName}\\b[^>]*>([\\s\\S]*?)<\\/[^>]*:?${propertyName}>`, "iu").exec(xml);
+  const value = match?.[1]?.replace(/<[^>]+>/gu, "").trim();
+  return value === undefined || value === "" ? undefined : decodeXmlEntities(value);
+}
+
+function propertyXmlBlock(xml: string, propertyName: string): string | undefined {
+  return new RegExp(`<[^>]*:?${propertyName}\\b[^>]*>[\\s\\S]*?<\\/[^>]*:?${propertyName}>`, "iu").exec(xml)?.[0];
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&amp;", "&");
+}
+
+function lastUrlSegment(url: string): string {
+  return decodeURIComponent(new URL(url).pathname.replace(/\/$/u, "").split("/").at(-1) ?? url);
+}
+
+function normalizeAddressBookSelector(value: string): string {
+  return value.trim().replace(/\/$/u, "");
 }
 
 function parseArgs(args: string[]): ParsedArgs {

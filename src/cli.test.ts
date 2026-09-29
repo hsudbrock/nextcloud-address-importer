@@ -14,6 +14,48 @@ Ada,Lovelace,+44 20 0000 0000,Friends
 Grace,Hopper,+1 555 0100,Work
 `;
 
+function xmlResponse(body: string, status = 207): Response {
+  return new Response(body, { status });
+}
+
+function successfulCardDavFetch(addressBooksXml = addressBookListXml()): typeof fetch {
+  return vi
+    .fn<typeof fetch>()
+    .mockResolvedValueOnce(
+      xmlResponse(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/</d:href>
+    <d:propstat><d:prop><d:current-user-principal><d:href>/remote.php/dav/principals/users/ada/</d:href></d:current-user-principal></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`),
+    )
+    .mockResolvedValueOnce(
+      xmlResponse(`<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:response>
+    <d:href>/remote.php/dav/principals/users/ada/</d:href>
+    <d:propstat><d:prop><card:addressbook-home-set><d:href>/remote.php/dav/addressbooks/users/ada/</d:href></card:addressbook-home-set></d:prop></d:propstat>
+  </d:response>
+</d:multistatus>`),
+    )
+    .mockResolvedValueOnce(xmlResponse(addressBooksXml));
+}
+
+function addressBookListXml(entries = [{ displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/contacts/" }]): string {
+  return `<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+${entries
+  .map(
+    (entry) => `  <d:response>
+    <d:href>${entry.href}</d:href>
+    <d:propstat><d:prop><d:displayname>${entry.displayName}</d:displayname><d:resourcetype><d:collection /><card:addressbook /></d:resourcetype></d:prop></d:propstat>
+  </d:response>`,
+  )
+  .join("\n")}
+</d:multistatus>`;
+}
+
 function importRuntime(csv: string): CliRuntime {
   return {
     env: validConnectionEnv,
@@ -174,10 +216,26 @@ Grace,  ,+1 555 0100,Work
         NEXTCLOUD_ADDRESS_IMPORTER_USERNAME: "ada",
         NEXTCLOUD_ADDRESS_IMPORTER_APP_PASSWORD: "env-secret",
       },
+      fetch: successfulCardDavFetch(),
     });
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("Address book discovery command is available.");
+    expect(result.stdout).toContain("Contacts\thttps://nextcloud.example.com/remote.php/dav/addressbooks/users/ada/contacts/");
+  });
+
+  it("starts CardDAV discovery from the server DAV base", async () => {
+    const fetch = successfulCardDavFetch();
+
+    await runCli(["address-books"], {
+      env: validConnectionEnv,
+      fetch,
+    });
+
+    expect(fetch).toHaveBeenNthCalledWith(
+      1,
+      new URL("https://nextcloud.example.com/remote.php/dav/"),
+      expect.objectContaining({ method: "PROPFIND", headers: expect.objectContaining({ Depth: "0" }) }),
+    );
   });
 
   it("fails when import is missing a CSV path", async () => {
@@ -215,6 +273,9 @@ username = "config-user"
 app_password = "config-secret"
 address_book = "Config Contacts"
 `,
+        fetch: successfulCardDavFetch(
+          addressBookListXml([{ displayName: "CLI Contacts", href: "/remote.php/dav/addressbooks/users/ada/cli-contacts/" }]),
+        ),
       },
     );
 
@@ -236,7 +297,7 @@ address_book = "Config Contacts"
         "--username=ada",
         "--app-password=secret=with=equals",
       ],
-      { env: {} },
+      { env: {}, fetch: successfulCardDavFetch() },
     );
 
     expect(result.exitCode).toBe(0);
@@ -254,7 +315,7 @@ address_book = "Config Contacts"
         "--app-password",
         "-secret",
       ],
-      { env: {} },
+      { env: {}, fetch: successfulCardDavFetch() },
     );
 
     expect(result.exitCode).toBe(0);
@@ -282,6 +343,9 @@ username = "config-user"
 app_password = "config-secret"
 address_book = "Config Contacts"
 `,
+      fetch: successfulCardDavFetch(
+        addressBookListXml([{ displayName: "Env Contacts", href: "/remote.php/dav/addressbooks/users/ada/env-contacts/" }]),
+      ),
     });
 
     expect(result.exitCode).toBe(0);
@@ -305,6 +369,7 @@ app_password = "config-secret"
       env: {},
       homeDir: "/home/example",
       readFile,
+      fetch: successfulCardDavFetch(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -320,6 +385,7 @@ server_url = 'https://config.example.com'
 username = 'config-user'
 app_password = 'config-secret'
 `,
+      fetch: successfulCardDavFetch(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -352,6 +418,7 @@ app_password = 'config-secret'
       },
       isInteractive: true,
       promptHidden,
+      fetch: successfulCardDavFetch(),
     });
 
     expect(result.exitCode).toBe(0);
@@ -399,6 +466,63 @@ app_password = 'config-secret'
     expect(result.exitCode).toBe(1);
     expect(result.stderr.join("\n")).toContain("Invalid config file: /tmp/config.toml");
     expect(result.stderr.join("\n")).not.toContain("config-secret");
+  });
+
+  it("resolves configured address books by discovered CardDAV URL path", async () => {
+    const result = await runCli(["address-books", "--address-book", "/remote.php/dav/addressbooks/users/ada/family"], {
+      env: validConnectionEnv,
+      fetch: successfulCardDavFetch(
+        addressBookListXml([{ displayName: "Family", href: "/remote.php/dav/addressbooks/users/ada/family/" }]),
+      ),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Family\thttps://nextcloud.example.com/remote.php/dav/addressbooks/users/ada/family/");
+  });
+
+  it("fails when a configured address book display name is ambiguous", async () => {
+    const result = await runCli(["address-books", "--address-book", "Contacts"], {
+      env: validConnectionEnv,
+      fetch: successfulCardDavFetch(
+        addressBookListXml([
+          { displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/contacts/" },
+          { displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/shared-contacts/" },
+        ]),
+      ),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Configured address book is ambiguous");
+  });
+
+  it("fails safely on CardDAV authentication failure", async () => {
+    const result = await runCli(["address-books"], {
+      env: validConnectionEnv,
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(xmlResponse("Unauthorized", 401)),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("CardDAV authentication failed");
+  });
+
+  it("fails safely on CardDAV discovery failure", async () => {
+    const result = await runCli(["address-books"], {
+      env: validConnectionEnv,
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(xmlResponse("Not found", 404)),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("expected 207 Multi-Status, got HTTP 404");
+  });
+
+  it("fails safely on CardDAV network failure", async () => {
+    const result = await runCli(["address-books"], {
+      env: validConnectionEnv,
+      fetch: vi.fn<typeof fetch>().mockRejectedValue(new Error("connection refused")),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Network error during CardDAV discovery");
   });
 });
 
