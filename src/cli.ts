@@ -44,6 +44,7 @@ export type CliRuntime = {
   homeDir?: string;
   isInteractive?: boolean;
   promptHidden?: (prompt: string) => Promise<string>;
+  prompt?: (prompt: string) => Promise<string>;
 };
 
 export type AddressBook = {
@@ -149,9 +150,12 @@ Options:
   --username <name>
   --app-password <password>
   --address-book <name-or-url>
-  --dry-run
-  --yes
+  --dry-run              Validate, discover, and check duplicates without writing.
+  --yes                  Skip the interactive import confirmation prompt.
   --json-report <path>
+
+Interactive import asks for confirmation before creating contacts.
+Non-interactive import requires --yes, otherwise it fails before writing.
 `);
   }
 
@@ -191,28 +195,99 @@ Options:
     return fail(discoveryResult);
   }
 
-  const selectedAddressBookResult = selectImportAddressBook(discoveryResult, connection, runtime);
+  const selectedAddressBookResult = await selectImportAddressBook(discoveryResult, connection, runtime);
 
-  if (typeof selectedAddressBookResult === "string") {
-    return fail(selectedAddressBookResult);
+  if (selectedAddressBookResult.error !== undefined) {
+    return {
+      exitCode: 1,
+      stdout: [...selectedAddressBookResult.lines],
+      stderr: [selectedAddressBookResult.error],
+      connection,
+    };
   }
 
-  const existingIdentitiesResult = await fetchExistingIdentities(selectedAddressBookResult, connection, runtime);
+  const selectedAddressBook = selectedAddressBookResult.addressBook;
+  const selectionLines = selectedAddressBookResult.lines;
+  const validationLine = `CSV validation passed: ${csvValidationResult.rowCount} ${csvValidationResult.rowCount === 1 ? "contact row" : "contact rows"} ready from ${csvPath}`;
+
+  const existingIdentitiesResult = await fetchExistingIdentities(selectedAddressBook, connection, runtime);
 
   if (typeof existingIdentitiesResult === "string") {
     return fail(existingIdentitiesResult);
   }
 
-  const report = parsedArgs.options.dryRun === true
-    ? planDryRun(csvValidationResult.contactPlans, existingIdentitiesResult, csvValidationResult.warnings)
-    : await createContacts(
-        selectedAddressBookResult,
+  if (parsedArgs.options.dryRun === true) {
+    const report = planDryRun(csvValidationResult.contactPlans, existingIdentitiesResult, csvValidationResult.warnings);
+
+    if (parsedArgs.options.jsonReport !== undefined) {
+      const jsonReportResult = await writeJsonReport(parsedArgs.options.jsonReport, report, runtime);
+
+      if (jsonReportResult !== undefined) {
+        return {
+          exitCode: 1,
+          stdout: [validationLine, ...selectionLines, ...renderRunSummary(report)],
+          stderr: [jsonReportResult],
+          connection,
+        };
+      }
+    }
+
+    return {
+      exitCode: report.status === "partial_failure" ? 2 : 0,
+      stdout: [validationLine, ...selectionLines, ...renderRunSummary(report)],
+      stderr: [],
+      connection,
+    };
+  }
+
+  const { toCreate, skippedDuplicates } = partitionContactPlans(csvValidationResult.contactPlans, existingIdentitiesResult);
+  const confirmationSummary = `Ready to create ${toCreate.length} ${toCreate.length === 1 ? "contact" : "contacts"} (${skippedDuplicates.length} skipped existing ${skippedDuplicates.length === 1 ? "duplicate" : "duplicates"}) in address book "${selectedAddressBook.displayName}" (${selectedAddressBook.url}) from ${csvPath}.`;
+
+  if (parsedArgs.options.yes !== true) {
+    const interactive = isInteractiveRuntime(runtime);
+
+    if (!interactive) {
+      return {
+        exitCode: 1,
+        stdout: [validationLine, ...selectionLines, confirmationSummary],
+        stderr: ["Refusing to import without confirmation in non-interactive mode. Re-run with --yes to confirm, or run interactively to review and confirm."],
         connection,
-        csvValidationResult.contactPlans,
-        existingIdentitiesResult,
-        csvValidationResult.warnings,
-        runtime,
-      );
+      };
+    }
+
+    const confirmationResult = await requestImportConfirmation(confirmationSummary, runtime);
+
+    if (confirmationResult.error !== undefined) {
+      return {
+        exitCode: 1,
+        stdout: [validationLine, ...selectionLines, confirmationSummary],
+        stderr: [confirmationResult.error],
+        connection,
+      };
+    }
+
+    if (!confirmationResult.confirmed) {
+      return {
+        exitCode: 1,
+        stdout: [validationLine, ...selectionLines, confirmationSummary, "Import cancelled: no contacts were written."],
+        stderr: [],
+        connection,
+      };
+    }
+
+    selectionLines.push(confirmationSummary);
+  } else {
+    selectionLines.push(confirmationSummary);
+  }
+
+  const report = await createContacts(
+    selectedAddressBook,
+    connection,
+    csvValidationResult.contactPlans,
+    existingIdentitiesResult,
+    csvValidationResult.warnings,
+    runtime,
+  );
 
   if (parsedArgs.options.jsonReport !== undefined) {
     const jsonReportResult = await writeJsonReport(parsedArgs.options.jsonReport, report, runtime);
@@ -220,10 +295,7 @@ Options:
     if (jsonReportResult !== undefined) {
       return {
         exitCode: report.dryRun ? 1 : 2,
-        stdout: [
-          `CSV validation passed: ${csvValidationResult.rowCount} ${csvValidationResult.rowCount === 1 ? "contact row" : "contact rows"} ready from ${csvPath}`,
-          ...renderRunSummary(report),
-        ],
+        stdout: [validationLine, ...selectionLines, ...renderRunSummary(report)],
         stderr: [jsonReportResult],
         connection,
       };
@@ -232,26 +304,100 @@ Options:
 
   return {
     exitCode: report.status === "partial_failure" ? 2 : 0,
-    stdout: [`CSV validation passed: ${csvValidationResult.rowCount} ${csvValidationResult.rowCount === 1 ? "contact row" : "contact rows"} ready from ${csvPath}`, ...renderRunSummary(report)],
+    stdout: [validationLine, ...selectionLines, ...renderRunSummary(report)],
     stderr: [],
     connection,
   };
 }
 
-function selectImportAddressBook(addressBooks: AddressBook[], connection: ConnectionConfig, runtime: CliRuntime): AddressBook | string {
+type ImportAddressBookSelection =
+  | { addressBook: AddressBook; lines: string[]; error?: undefined }
+  | { addressBook?: undefined; lines: string[]; error: string };
+
+async function selectImportAddressBook(
+  addressBooks: AddressBook[],
+  connection: ConnectionConfig,
+  runtime: CliRuntime,
+): Promise<ImportAddressBookSelection> {
   if (connection.addressBook !== undefined) {
-    return selectAddressBook(addressBooks, connection.addressBook);
+    const selected = selectAddressBook(addressBooks, connection.addressBook);
+    return typeof selected === "string" ? { error: selected, lines: [] } : { addressBook: selected, lines: [] };
+  }
+
+  if (addressBooks.length === 0) {
+    return { error: "CardDAV discovery failed: no address books were returned.", lines: [] };
   }
 
   if (addressBooks.length === 1) {
-    return addressBooks[0] ?? "CardDAV discovery failed: no address books were returned.";
+    const single = addressBooks[0];
+    return single === undefined
+      ? { error: "CardDAV discovery failed: no address books were returned.", lines: [] }
+      : { addressBook: single, lines: [] };
   }
 
-  if (runtime.isInteractive ?? (process.stdin.isTTY === true && process.stdout.isTTY === true)) {
-    return "Interactive address-book selection is not implemented yet. Set --address-book to choose a discovered address book.";
+  if (!isInteractiveRuntime(runtime)) {
+    return { error: "Multiple address books were discovered. Set --address-book because non-interactive import cannot prompt for a selection.", lines: [] };
   }
 
-  return "Multiple address books were discovered. Set --address-book because non-interactive import cannot prompt for a selection.";
+  const listLines = ["Multiple address books found:"];
+  addressBooks.forEach((addressBook, index) => {
+    listLines.push(`  ${index + 1}) ${addressBook.displayName} (${addressBook.url})`);
+  });
+  const promptText = `${listLines.join("\n")}\nSelect address book [1-${addressBooks.length}]: `;
+  const prompt = runtime.prompt ?? defaultPrompt;
+  let answer: string;
+
+  try {
+    answer = await prompt(promptText);
+  } catch {
+    return { error: "Could not read address-book selection. Set --address-book to choose a discovered address book.", lines: listLines };
+  }
+
+  const trimmed = answer.trim();
+
+  if (!/^\d+$/.test(trimmed)) {
+    return { error: `Invalid address-book selection: ${trimmed === "" ? "(empty)" : trimmed}. Enter a number between 1 and ${addressBooks.length}.`, lines: listLines };
+  }
+
+  const selectedIndex = Number.parseInt(trimmed, 10) - 1;
+  const selected = addressBooks[selectedIndex];
+
+  if (selected === undefined) {
+    return { error: `Invalid address-book selection: ${trimmed}. Enter a number between 1 and ${addressBooks.length}.`, lines: listLines };
+  }
+
+  return { addressBook: selected, lines: [...listLines, `Selected address book: ${selected.displayName}`] };
+}
+
+function isInteractiveRuntime(runtime: CliRuntime): boolean {
+  return runtime.isInteractive ?? (process.stdin.isTTY === true && process.stdout.isTTY === true);
+}
+
+async function requestImportConfirmation(
+  summary: string,
+  runtime: CliRuntime,
+): Promise<{ confirmed: boolean; error?: undefined } | { confirmed?: undefined; error: string }> {
+  const prompt = runtime.prompt ?? defaultPrompt;
+  let answer: string;
+
+  try {
+    answer = await prompt(`${summary}\nProceed? [y/N]: `);
+  } catch {
+    return { error: "Could not read import confirmation. Re-run with --yes to confirm non-interactively." };
+  }
+
+  const normalized = answer.trim().toLowerCase();
+  return { confirmed: normalized === "y" || normalized === "yes" };
+}
+
+async function defaultPrompt(prompt: string): Promise<string> {
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+
+  try {
+    return await readline.question(prompt);
+  } finally {
+    readline.close();
+  }
 }
 
 type PutResult = { status: "created" } | { status: "failed"; message: string };

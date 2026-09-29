@@ -118,7 +118,7 @@ describe("runCli", () => {
   });
 
   it("exposes the import command shell", async () => {
-    const result = await runCli(["import", "contacts.csv"], importRuntime(validCsv));
+    const result = await runCli(["import", "contacts.csv", "--yes"], importRuntime(validCsv));
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("CSV validation passed: 2 contact rows ready from contacts.csv");
@@ -126,7 +126,7 @@ describe("runCli", () => {
 
   it("accepts semicolon-separated CSV and quoted delimiters", async () => {
     const result = await runCli(
-      ["import", "contacts.csv"],
+      ["import", "contacts.csv", "--yes"],
       importRuntime(`telephone;group;last_name;first_name
 "+44;20";Friends;Lovelace;Ada
 "+1,555";Work;Hopper;Grace
@@ -139,7 +139,7 @@ describe("runCli", () => {
 
   it("accepts a UTF-8 BOM and reports ignored blank lines", async () => {
     const result = await runCli(
-      ["import", "contacts.csv"],
+      ["import", "contacts.csv", "--yes"],
       importRuntime(`\ufefffirst_name,last_name,telephone,group
 
 Ada,Lovelace,+44 20 0000 0000,Friends
@@ -153,7 +153,7 @@ Ada,Lovelace,+44 20 0000 0000,Friends
 
   it("warns about extra CSV columns without failing", async () => {
     const result = await runCli(
-      ["import", "contacts.csv"],
+      ["import", "contacts.csv", "--yes"],
       importRuntime(`first_name,last_name,telephone,group,"notes;private"
 Ada,Lovelace,+44 20 0000 0000,Friends,ignored
 `),
@@ -209,7 +209,7 @@ Ada,Lovelace,+44 20 0000 0000,Work
 
   it("accepts a valid literal replacement character in CSV text", async () => {
     const result = await runCli(
-      ["import", "contacts.csv"],
+      ["import", "contacts.csv", "--yes"],
       importRuntime("first_name,last_name,telephone,group\nAda,Lovelace,�,Friends\n"),
     );
 
@@ -220,7 +220,7 @@ Ada,Lovelace,+44 20 0000 0000,Work
   it("writes a safe JSON run report", async () => {
     const writeFile = vi.fn<(path: string, contents: string) => Promise<void>>(async () => undefined);
 
-    const result = await runCli(["import", "contacts.csv", "--json-report", "report.json"], {
+    const result = await runCli(["import", "contacts.csv", "--yes", "--json-report", "report.json"], {
       ...importRuntime(validCsv),
       writeFile,
     });
@@ -241,7 +241,7 @@ Ada,Lovelace,+44 20 0000 0000,Work
       .mockResolvedValueOnce(new Response("still failing", { status: 500 }))
       .mockResolvedValue(new Response("", { status: 201 }));
 
-    const result = await runCli(["import", "contacts.csv"], {
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
       ...importRuntime(validCsv),
       fetch,
     });
@@ -273,7 +273,7 @@ Ada,Lovelace,+44 20 0000 0000,Work
       .mockResolvedValueOnce(existingContactVcardResponse())
       .mockResolvedValue(new Response("", { status: 201 }));
 
-    const result = await runCli(["import", "contacts.csv"], {
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
       ...importRuntime(validCsv),
       fetch,
     });
@@ -307,7 +307,7 @@ Ada,Lovelace,+44 20 0000 0000,Work
       .mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()))
       .mockResolvedValue(new Response("conflict", { status: 412 }));
 
-    const result = await runCli(["import", "contacts.csv"], {
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
       ...importRuntime(validCsv),
       fetch,
     });
@@ -664,6 +664,172 @@ app_password = 'config-secret'
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr.join("\n")).toContain("Network error during CardDAV discovery");
+  });
+
+  it("asks for confirmation in interactive mode and creates on approval", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "y");
+    const fetch = successfulImportFetch();
+
+    const result = await runCli(["import", "contacts.csv"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt.mock.calls[0]?.[0]).toContain("Ready to create 2 contacts");
+    expect(prompt.mock.calls[0]?.[0]).toContain("Contacts");
+    expect(prompt.mock.calls[0]?.[0]).toContain("Proceed? [y/N]");
+    expect(prompt.mock.calls[0]?.[0]).not.toContain("Ada");
+    expect(prompt.mock.calls[0]?.[0]).not.toContain("env-secret");
+    expect(result.stdout.join("\n")).toContain("Import writes completed.");
+    expect(result.stdout.join("\n")).toContain("Created contacts: 2");
+  });
+
+  it("cancels import when interactive confirmation is declined", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "n");
+    const fetch = successfulCardDavFetch().mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()));
+
+    const result = await runCli(["import", "contacts.csv"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.join("\n")).toContain("Import cancelled: no contacts were written.");
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("skips confirmation when --yes is given in interactive mode", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "y");
+    const fetch = successfulImportFetch();
+
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(prompt).not.toHaveBeenCalled();
+    expect(result.stdout.join("\n")).toContain("Created contacts: 2");
+  });
+
+  it("fails in non-interactive mode without --yes before writing", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "y");
+    const fetch = successfulCardDavFetch().mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()));
+
+    const result = await runCli(["import", "contacts.csv"], {
+      ...importRuntime(validCsv),
+      isInteractive: false,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("non-interactive");
+    expect(result.stderr.join("\n")).toContain("--yes");
+    expect(prompt).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not prompt for confirmation during dry runs", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "y");
+    const fetch = successfulCardDavFetch().mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()));
+
+    const result = await runCli(["import", "contacts.csv", "--dry-run"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(prompt).not.toHaveBeenCalled();
+    expect(result.stdout).toContain("Dry run: no contacts were written.");
+  });
+
+  it("selects an address book from a numbered interactive list", async () => {
+    const twoBooks = addressBookListXml([
+      { displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/contacts/" },
+      { displayName: "Family", href: "/remote.php/dav/addressbooks/users/ada/family/" },
+    ]);
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "2");
+    const fetch = successfulCardDavFetch(twoBooks)
+      .mockResolvedValueOnce(xmlResponse(emptyAddressBookContentsXml()))
+      .mockResolvedValue(new Response("", { status: 201 }));
+
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(prompt.mock.calls[0]?.[0]).toContain("1) Contacts");
+    expect(prompt.mock.calls[0]?.[0]).toContain("2) Family");
+    expect(prompt.mock.calls[0]?.[0]).toContain("https://nextcloud.example.com/remote.php/dav/addressbooks/users/ada/family/");
+    expect(result.stdout.join("\n")).toContain("Selected address book: Family");
+    const putCalls = fetch.mock.calls.filter(([, init]) => (init as RequestInit)?.method === "PUT");
+    expect(putCalls.length).toBe(2);
+    expect(String(putCalls[0]?.[0])).toContain("/family/");
+  });
+
+  it("fails on invalid numbered address-book selection", async () => {
+    const twoBooks = addressBookListXml([
+      { displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/contacts/" },
+      { displayName: "Family", href: "/remote.php/dav/addressbooks/users/ada/family/" },
+    ]);
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "99");
+
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch: successfulCardDavFetch(twoBooks),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("Invalid address-book selection");
+  });
+
+  it("fails address-book selection in non-interactive mode without --address-book", async () => {
+    const twoBooks = addressBookListXml([
+      { displayName: "Contacts", href: "/remote.php/dav/addressbooks/users/ada/contacts/" },
+      { displayName: "Family", href: "/remote.php/dav/addressbooks/users/ada/family/" },
+    ]);
+
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
+      ...importRuntime(validCsv),
+      isInteractive: false,
+      fetch: successfulCardDavFetch(twoBooks),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("non-interactive import cannot prompt");
+    expect(result.stderr.join("\n")).toContain("--address-book");
+  });
+
+  it("fails discovery when no address books are returned without prompting", async () => {
+    const prompt = vi.fn<(promptText: string) => Promise<string>>(async () => "1");
+
+    const result = await runCli(["import", "contacts.csv", "--yes"], {
+      ...importRuntime(validCsv),
+      isInteractive: true,
+      prompt,
+      fetch: successfulCardDavFetch(addressBookListXml([])),
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.join("\n")).toContain("no address books were returned");
+    expect(prompt).not.toHaveBeenCalled();
   });
 });
 
