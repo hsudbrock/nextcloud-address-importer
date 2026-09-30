@@ -2,6 +2,7 @@
   "name": "nextcloud-address-importer",
   "version": "0.1.0",
   "description": "Local CLI importer for CSV contacts into Nextcloud Contacts via CardDAV.",
+  "license": "MIT",
   "type": "module",
   "bin": {
     "nextcloud-address-importer": "./dist/cli.js"
